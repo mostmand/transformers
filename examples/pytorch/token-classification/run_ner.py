@@ -501,8 +501,10 @@ def main():
 
     # Predict
     if training_args.do_predict:
-        predictions, label_ids, metrics = trainer.predict(predict_dataset)
-        preds_list, _ = align_predictions(predictions, label_ids)
+        logger.info("*** Predict ***")
+
+        predictions, labels, metrics = trainer.predict(predict_dataset, metric_key_prefix="predict")
+        predictions = np.argmax(predictions, axis=2)
 
         output_test_results_file = os.path.join(training_args.output_dir, "test_results.txt")
         if trainer.is_world_process_zero():
@@ -511,25 +513,22 @@ def main():
                     logger.info("  %s = %s", key, value)
                     writer.write("%s = %s\n" % (key, value))
 
-        def write_predictions_to_file(self, writer: TextIO, test_input_reader: TextIO, preds_list: List):
-            example_id = 0
-            for line in test_input_reader:
-                if line.startswith("-DOCSTART-") or line == "" or line == "\n":
-                    writer.write(line)
-                    if not preds_list[example_id]:
-                        example_id += 1
-                elif preds_list[example_id]:
-                    output_line = line.split()[0] + " " + preds_list[example_id].pop(0) + "\n"
-                    writer.write(output_line)
-                else:
-                    logger.warning("Maximum sequence length exceeded: No prediction for '%s'.", line.split()[0])
+        # Remove ignored index (special tokens)
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+
+        trainer.log_metrics("predict", metrics)
+        trainer.save_metrics("predict", metrics)
 
         # Save predictions
-        output_test_predictions_file = os.path.join(training_args.output_dir, "predictions.txt")
+        output_predictions_file = os.path.join(training_args.output_dir, "predictions.txt")
         if trainer.is_world_process_zero():
-            with open(output_test_predictions_file, "w") as writer:
-                with open(os.path.join(data_args.data_dir, "test.txt"), "r") as f:
-                    write_predictions_to_file(writer, f, preds_list)
+            with open(output_predictions_file, "w") as writer:
+                for prediction in true_predictions:
+                    writer.write(" ".join(prediction) + "\n")
+
 
     if training_args.push_to_hub:
         kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "token-classification"}
