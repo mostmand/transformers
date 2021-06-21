@@ -23,10 +23,12 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, TextIO
 
 import numpy as np
+from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
 from datasets import ClassLabel, load_dataset, load_metric
+from torch import nn
 
 import transformers
 from transformers import (
@@ -40,9 +42,10 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import EvalPrediction, get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
+from typing import Tuple, List
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -427,38 +430,31 @@ def main():
     # Metrics
     metric = load_metric("seqeval")
 
-    def compute_metrics(p):
-        predictions, labels = p
-        predictions = np.argmax(predictions, axis=2)
+    def align_predictions(predictions: np.ndarray, label_ids: np.ndarray) -> Tuple[List[int], List[int]]:
+        label_map = {i: l for l, i in label_to_id.items()}
+        preds = np.argmax(predictions, axis=2)
 
-        # Remove ignored index (special tokens)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
+        batch_size, seq_len = preds.shape
 
-        results = metric.compute(predictions=true_predictions, references=true_labels)
-        if data_args.return_entity_level_metrics:
-            # Unpack nested dictionaries
-            final_results = {}
-            for key, value in results.items():
-                if isinstance(value, dict):
-                    for n, v in value.items():
-                        final_results[f"{key}_{n}"] = v
-                else:
-                    final_results[key] = value
-            return final_results
-        else:
-            return {
-                "precision": results["overall_precision"],
-                "recall": results["overall_recall"],
-                "f1": results["overall_f1"],
-                "accuracy": results["overall_accuracy"],
-            }
+        out_label_list = [[] for _ in range(batch_size)]
+        preds_list = [[] for _ in range(batch_size)]
+
+        for i in range(batch_size):
+            for j in range(seq_len):
+                if label_ids[i, j] != nn.CrossEntropyLoss().ignore_index:
+                    out_label_list[i].append(label_map[label_ids[i][j]])
+                    preds_list[i].append(label_map[preds[i][j]])
+
+        return preds_list, out_label_list
+
+    def compute_metrics(p: EvalPrediction) -> Dict:
+        preds_list, out_label_list = align_predictions(p.predictions, p.label_ids)
+        return {
+            "accuracy_score": accuracy_score(out_label_list, preds_list),
+            "precision": precision_score(out_label_list, preds_list),
+            "recall": recall_score(out_label_list, preds_list),
+            "f1": f1_score(out_label_list, preds_list),
+        }
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -505,26 +501,35 @@ def main():
 
     # Predict
     if training_args.do_predict:
-        logger.info("*** Predict ***")
+        predictions, label_ids, metrics = trainer.predict(predict_dataset)
+        preds_list, _ = align_predictions(predictions, label_ids)
 
-        predictions, labels, metrics = trainer.predict(predict_dataset, metric_key_prefix="predict")
-        predictions = np.argmax(predictions, axis=2)
+        output_test_results_file = os.path.join(training_args.output_dir, "test_results.txt")
+        if trainer.is_world_process_zero():
+            with open(output_test_results_file, "w") as writer:
+                for key, value in metrics.items():
+                    logger.info("  %s = %s", key, value)
+                    writer.write("%s = %s\n" % (key, value))
 
-        # Remove ignored index (special tokens)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-
-        trainer.log_metrics("predict", metrics)
-        trainer.save_metrics("predict", metrics)
+        def write_predictions_to_file(self, writer: TextIO, test_input_reader: TextIO, preds_list: List):
+            example_id = 0
+            for line in test_input_reader:
+                if line.startswith("-DOCSTART-") or line == "" or line == "\n":
+                    writer.write(line)
+                    if not preds_list[example_id]:
+                        example_id += 1
+                elif preds_list[example_id]:
+                    output_line = line.split()[0] + " " + preds_list[example_id].pop(0) + "\n"
+                    writer.write(output_line)
+                else:
+                    logger.warning("Maximum sequence length exceeded: No prediction for '%s'.", line.split()[0])
 
         # Save predictions
-        output_predictions_file = os.path.join(training_args.output_dir, "predictions.txt")
+        output_test_predictions_file = os.path.join(training_args.output_dir, "predictions.txt")
         if trainer.is_world_process_zero():
-            with open(output_predictions_file, "w") as writer:
-                for prediction in true_predictions:
-                    writer.write(" ".join(prediction) + "\n")
+            with open(output_test_predictions_file, "w") as writer:
+                with open(os.path.join(data_args.data_dir, "test.txt"), "r") as f:
+                    write_predictions_to_file(writer, f, preds_list)
 
     if training_args.push_to_hub:
         kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "token-classification"}
